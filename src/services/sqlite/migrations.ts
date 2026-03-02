@@ -495,6 +495,62 @@ export const migration007: Migration = {
   }
 };
 
+export const migration008: Migration = {
+  version: 8,
+  up: (db: Database) => {
+    // Store verbatim assistant responses from Claude Code session JSONL files.
+    // Mirrors user_prompts structure: one row per assistant turn, keyed to the
+    // same claude_session_id so prompts and responses can be paired by prompt_number.
+    db.run(`
+      CREATE TABLE IF NOT EXISTS assistant_responses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        claude_session_id TEXT NOT NULL,
+        prompt_number INTEGER NOT NULL,
+        response_text TEXT NOT NULL,
+        message_uuid TEXT,
+        created_at TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        FOREIGN KEY(claude_session_id) REFERENCES sdk_sessions(claude_session_id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_assistant_responses_session
+        ON assistant_responses(claude_session_id);
+      CREATE INDEX IF NOT EXISTS idx_assistant_responses_project_epoch
+        ON assistant_responses(claude_session_id, created_at_epoch DESC);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS assistant_responses_fts USING fts5(
+        response_text,
+        content='assistant_responses',
+        content_rowid='id'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS assistant_responses_fts_insert
+        AFTER INSERT ON assistant_responses BEGIN
+          INSERT INTO assistant_responses_fts(rowid, response_text)
+            VALUES (new.id, new.response_text);
+        END;
+      CREATE TRIGGER IF NOT EXISTS assistant_responses_fts_update
+        AFTER UPDATE ON assistant_responses BEGIN
+          INSERT INTO assistant_responses_fts(assistant_responses_fts, rowid, response_text)
+            VALUES ('delete', old.id, old.response_text);
+          INSERT INTO assistant_responses_fts(rowid, response_text)
+            VALUES (new.id, new.response_text);
+        END;
+      CREATE TRIGGER IF NOT EXISTS assistant_responses_fts_delete
+        AFTER DELETE ON assistant_responses BEGIN
+          INSERT INTO assistant_responses_fts(assistant_responses_fts, rowid, response_text)
+            VALUES ('delete', old.id, old.response_text);
+        END;
+    `);
+    console.log('✅ Created assistant_responses table with FTS5 index');
+  },
+
+  down: (db: Database) => {
+    db.run(`DROP TABLE IF EXISTS assistant_responses_fts`);
+    db.run(`DROP TABLE IF EXISTS assistant_responses`);
+  }
+};
+
 /**
  * All migrations in order
  */
@@ -505,5 +561,6 @@ export const migrations: Migration[] = [
   migration004,
   migration005,
   migration006,
-  migration007
+  migration007,
+  migration008
 ];
