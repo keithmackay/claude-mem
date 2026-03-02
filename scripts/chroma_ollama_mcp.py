@@ -69,7 +69,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # 120s timeout: first call may need to load model from disk
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
         embeddings.append(data["embedding"])
     return embeddings
