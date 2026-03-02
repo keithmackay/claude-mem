@@ -97,20 +97,45 @@ export class ChromaSync {
     logger.info('CHROMA_SYNC', 'Connecting to Chroma MCP server...', { project: this.project });
 
     try {
-      // Use Python 3.13 by default to avoid onnxruntime compatibility issues with Python 3.14+
-      // See: https://github.com/thedotmack/claude-mem/issues/170 (Python 3.14 incompatibility)
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
       const pythonVersion = settings.CLAUDE_MEM_PYTHON_VERSION;
-      const transport = new StdioClientTransport({
-        command: 'uvx',
-        args: [
-          '--python', pythonVersion,
-          'chroma-mcp',
-          '--client-type', 'persistent',
-          '--data-dir', this.VECTOR_DB_DIR
-        ],
-        stderr: 'ignore'
-      });
+      const embeddingProvider = settings.CLAUDE_MEM_EMBEDDING_PROVIDER;
+
+      let transport: StdioClientTransport;
+
+      if (embeddingProvider === 'ollama') {
+        // Use our custom Ollama-backed MCP server (nomic-embed-text or configured model)
+        const scriptPath = path.join(os.homedir(), 'Projects', 'claude-mem', 'scripts', 'chroma_ollama_mcp.py');
+        logger.info('CHROMA_SYNC', 'Using Ollama embedding provider', {
+          model: settings.CLAUDE_MEM_OLLAMA_EMBED_MODEL,
+          base_url: settings.CLAUDE_MEM_OLLAMA_BASE_URL,
+        });
+        transport = new StdioClientTransport({
+          command: 'uvx',
+          args: ['--python', pythonVersion, '--with', 'chromadb>=1.0.0', '--with', 'mcp>=1.0.0', 'python', scriptPath],
+          env: {
+            ...process.env,
+            CHROMA_DATA_DIR: this.VECTOR_DB_DIR,
+            OLLAMA_BASE_URL: settings.CLAUDE_MEM_OLLAMA_BASE_URL,
+            OLLAMA_EMBED_MODEL: settings.CLAUDE_MEM_OLLAMA_EMBED_MODEL,
+          },
+          stderr: 'ignore',
+        });
+      } else {
+        // Default: use chroma-mcp with built-in sentence-transformers embeddings
+        // Use Python 3.13 by default to avoid onnxruntime compatibility issues with Python 3.14+
+        // See: https://github.com/thedotmack/claude-mem/issues/170 (Python 3.14 incompatibility)
+        transport = new StdioClientTransport({
+          command: 'uvx',
+          args: [
+            '--python', pythonVersion,
+            'chroma-mcp',
+            '--client-type', 'persistent',
+            '--data-dir', this.VECTOR_DB_DIR,
+          ],
+          stderr: 'ignore',
+        });
+      }
 
       this.client = new Client({
         name: 'claude-mem-chroma-sync',
@@ -155,11 +180,14 @@ export class ChromaSync {
       logger.info('CHROMA_SYNC', 'Creating collection', { collection: this.collectionName });
 
       try {
+        const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+        const embeddingProvider = settings.CLAUDE_MEM_EMBEDDING_PROVIDER;
         await this.client.callTool({
           name: 'chroma_create_collection',
           arguments: {
             collection_name: this.collectionName,
-            embedding_function_name: 'default'
+            // 'ollama' provider handles embeddings in the MCP server itself
+            embedding_function_name: embeddingProvider === 'ollama' ? 'ollama' : 'default',
           }
         });
 

@@ -21,6 +21,10 @@ export interface SettingsDefaults {
   CLAUDE_MEM_LOG_LEVEL: string;
   CLAUDE_MEM_PYTHON_VERSION: string;
   CLAUDE_CODE_PATH: string;
+  // Embedding Configuration
+  CLAUDE_MEM_EMBEDDING_PROVIDER: string;  // 'default' | 'ollama'
+  CLAUDE_MEM_OLLAMA_EMBED_MODEL: string;
+  CLAUDE_MEM_OLLAMA_BASE_URL: string;
   // Token Economics
   CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: string;
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: string;
@@ -52,6 +56,10 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
     CLAUDE_MEM_PYTHON_VERSION: '3.13',
     CLAUDE_CODE_PATH: '', // Empty means auto-detect via 'which claude'
+    // Embedding Configuration
+    CLAUDE_MEM_EMBEDDING_PROVIDER: 'ollama',
+    CLAUDE_MEM_OLLAMA_EMBED_MODEL: 'nomic-embed-text',
+    CLAUDE_MEM_OLLAMA_BASE_URL: 'http://localhost:11434',
     // Token Economics
     CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'true',
