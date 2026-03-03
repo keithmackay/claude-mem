@@ -74,6 +74,7 @@ export class SessionRoutes extends BaseRouteHandler {
 
     // New session endpoints (use claudeSessionId)
     app.post('/api/sessions/init', this.handleSessionInitByClaudeId.bind(this));
+    app.post('/api/sessions/response', this.handleResponseByClaudeId.bind(this));
     app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
     app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
     app.post('/api/sessions/complete', this.handleSessionCompleteByClaudeId.bind(this));
@@ -498,5 +499,29 @@ export class SessionRoutes extends BaseRouteHandler {
       promptNumber,
       skipped: false
     });
+  });
+
+  /**
+   * POST /api/sessions/response
+   * Log an assistant response for a session turn (provider-agnostic).
+   * Body: { claudeSessionId, promptNumber, responseText }
+   */
+  private handleResponseByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
+    const { claudeSessionId, promptNumber, responseText } = req.body;
+
+    if (!this.validateRequired(req, res, ['claudeSessionId', 'promptNumber', 'responseText'])) {
+      return;
+    }
+
+    if (!responseText || responseText.trim() === '') {
+      res.json({ skipped: true, reason: 'empty' });
+      return;
+    }
+
+    const store = this.dbManager.getSessionStore();
+    const id = store.saveAssistantResponse(claudeSessionId, Number(promptNumber), responseText);
+
+    logger.info('SESSION', 'Assistant response logged', { claudeSessionId, promptNumber, id });
+    res.json({ id, skipped: false });
   });
 }

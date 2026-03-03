@@ -1146,6 +1146,20 @@ export class SessionStore {
     return result.lastInsertRowid as number;
   }
 
+  saveAssistantResponse(claudeSessionId: string, promptNumber: number, responseText: string): number {
+    const now = new Date();
+    const nowEpoch = now.getTime();
+
+    const stmt = this.db.prepare(`
+      INSERT INTO assistant_responses
+      (claude_session_id, prompt_number, response_text, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const result = stmt.run(claudeSessionId, promptNumber, responseText, now.toISOString(), nowEpoch);
+    return result.lastInsertRowid as number;
+  }
+
   /**
    * Get user prompt by session ID and prompt number
    * Returns the prompt text, or null if not found
