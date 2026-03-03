@@ -44,8 +44,9 @@ HOME = Path.home()
 DATA_DIR        = os.environ.get("CHROMA_DATA_DIR",     str(HOME / ".claude-mem" / "vector-db"))
 DB_PATH         = os.environ.get("CLAUDE_MEM_DB",        str(HOME / ".claude-mem" / "claude-mem.db"))
 PROJECTS_DIR    = os.environ.get("CLAUDE_PROJECTS_DIR",  str(HOME / ".claude" / "projects"))
-OLLAMA_URL      = os.environ.get("OLLAMA_BASE_URL",      "http://localhost:11434") + "/api/embeddings"
-MODEL           = os.environ.get("OLLAMA_EMBED_MODEL",   "nomic-embed-text")
+OLLAMA_BASE     = os.environ.get("OLLAMA_BASE_URL",      "http://localhost:11434")
+OLLAMA_URL      = OLLAMA_BASE + "/api/embed"   # batch endpoint, supports all models
+MODEL           = os.environ.get("OLLAMA_EMBED_MODEL",   "all-minilm")
 FILTER_PROJECT  = os.environ.get("PROJECT", "")
 BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", "100"))
 DRY_RUN         = os.environ.get("DRY_RUN", "0") == "1"
@@ -63,25 +64,35 @@ PROJECT_DIR_MAP: dict[str, str] = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def embed_batch(texts: list[str], timeout: int = 120) -> list[list[float]]:
-    """Embed a list of texts via Ollama HTTP API."""
-    result = []
-    for text in texts:
-        payload = json.dumps({"model": MODEL, "prompt": text}).encode()
-        req = urllib.request.Request(
-            OLLAMA_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result.append(json.loads(resp.read())["embedding"])
-    return result
+MAX_CHARS = 500  # all-minilm has 256-token limit; dense text (paths) hits it ~600 chars
+
+def embed_batch(texts: list[str], timeout: int = 300, retries: int = 3) -> list[list[float]]:
+    """Embed texts via Ollama /api/embed (supports all models, accepts array input)."""
+    truncated = [t[:MAX_CHARS] for t in texts]
+    payload = json.dumps({"model": MODEL, "input": truncated}).encode()
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                OLLAMA_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())["embeddings"]
+        except TimeoutError:
+            if attempt < retries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"\n  [embed] timeout, retrying in {wait}s (attempt {attempt+1}/{retries})...", flush=True)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("embed_batch: unreachable")
 
 
 def warmup_ollama() -> None:
     """Ensure Ollama has the model loaded before batch processing."""
     print(f"Warming up {MODEL} in Ollama...", flush=True)
-    embed_batch(["warmup"], timeout=120)
+    embed_batch(["warmup"])
     print("Ollama ready.", flush=True)
 
 

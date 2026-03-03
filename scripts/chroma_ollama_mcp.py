@@ -38,8 +38,8 @@ from mcp.types import TextContent, Tool
 
 DATA_DIR = os.environ.get("CHROMA_DATA_DIR", os.path.expanduser("~/.claude-mem/vector-db"))
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-OLLAMA_EMBED_URL = f"{OLLAMA_BASE}/api/embeddings"
+OLLAMA_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "all-minilm")
+OLLAMA_EMBED_URL = f"{OLLAMA_BASE}/api/embed"
 
 # ---------------------------------------------------------------------------
 # ChromaDB client (persistent, path = DATA_DIR)
@@ -59,21 +59,20 @@ def get_client() -> chromadb.PersistentClient:
 # Ollama embedding helper
 # ---------------------------------------------------------------------------
 
+MAX_CHARS = 500  # all-minilm 256-token limit; dense text hits it ~600 chars
+
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Compute embeddings for a list of texts using Ollama."""
-    embeddings: list[list[float]] = []
-    for text in texts:
-        payload = json.dumps({"model": OLLAMA_MODEL, "prompt": text}).encode()
-        req = urllib.request.Request(
-            OLLAMA_EMBED_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        # 120s timeout: first call may need to load model from disk
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read())
-        embeddings.append(data["embedding"])
-    return embeddings
+    """Compute embeddings for a list of texts using Ollama /api/embed."""
+    payload = json.dumps({"model": OLLAMA_MODEL, "input": [t[:MAX_CHARS] for t in texts]}).encode()
+    req = urllib.request.Request(
+        OLLAMA_EMBED_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    # 300s timeout: first call may need to load model from disk
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read())
+    return data["embeddings"]
 
 
 # ---------------------------------------------------------------------------

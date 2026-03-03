@@ -58,7 +58,7 @@ export class SettingsDefaultsManager {
     CLAUDE_CODE_PATH: '', // Empty means auto-detect via 'which claude'
     // Embedding Configuration
     CLAUDE_MEM_EMBEDDING_PROVIDER: 'ollama',
-    CLAUDE_MEM_OLLAMA_EMBED_MODEL: 'nomic-embed-text',
+    CLAUDE_MEM_OLLAMA_EMBED_MODEL: 'all-minilm',
     CLAUDE_MEM_OLLAMA_BASE_URL: 'http://localhost:11434',
     // Token Economics
     CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'true',
