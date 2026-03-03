@@ -71,6 +71,18 @@ interface StoredUserPrompt {
   project: string;
 }
 
+interface StoredAssistantResponse {
+  id: number;
+  claude_session_id: string;
+  prompt_number: number;
+  response_text: string;
+  message_uuid: string | null;
+  created_at: string;
+  created_at_epoch: number;
+  sdk_session_id: string;
+  project: string;
+}
+
 export class ChromaSync {
   private client: Client | null = null;
   private connected: boolean = false;
@@ -512,13 +524,64 @@ export class ChromaSync {
   }
 
   /**
+   * Format assistant response into a Chroma document
+   * Each response becomes a single document (like user prompts)
+   */
+  private formatAssistantResponseDoc(response: StoredAssistantResponse): ChromaDocument {
+    return {
+      id: `response_${response.id}`,
+      document: response.response_text,
+      metadata: {
+        sqlite_id: response.id,
+        doc_type: 'assistant_response',
+        sdk_session_id: response.sdk_session_id,
+        project: response.project,
+        created_at_epoch: response.created_at_epoch,
+        prompt_number: response.prompt_number
+      }
+    };
+  }
+
+  /**
+   * Sync a single assistant response to Chroma
+   * Blocks until sync completes, throws on error
+   */
+  async syncAssistantResponse(
+    responseId: number,
+    sdkSessionId: string,
+    project: string,
+    responseText: string,
+    promptNumber: number,
+    createdAtEpoch: number
+  ): Promise<void> {
+    const stored: StoredAssistantResponse = {
+      id: responseId,
+      claude_session_id: '',
+      prompt_number: promptNumber,
+      response_text: responseText,
+      message_uuid: null,
+      created_at: new Date(createdAtEpoch * 1000).toISOString(),
+      created_at_epoch: createdAtEpoch,
+      sdk_session_id: sdkSessionId,
+      project
+    };
+
+    const document = this.formatAssistantResponseDoc(stored);
+
+    logger.info('CHROMA_SYNC', 'Syncing assistant response', { responseId, project });
+
+    await this.addDocuments([document]);
+  }
+
+  /**
    * Fetch all existing document IDs from Chroma collection
-   * Returns Sets of SQLite IDs for observations, summaries, and prompts
+   * Returns Sets of SQLite IDs for observations, summaries, prompts, and responses
    */
   private async getExistingChromaIds(): Promise<{
     observations: Set<number>;
     summaries: Set<number>;
     prompts: Set<number>;
+    responses: Set<number>;
   }> {
     await this.ensureConnection();
 
@@ -529,6 +592,7 @@ export class ChromaSync {
     const observationIds = new Set<number>();
     const summaryIds = new Set<number>();
     const promptIds = new Set<number>();
+    const responseIds = new Set<number>();
 
     let offset = 0;
     const limit = 1000; // Large batches, metadata only = fast
@@ -569,6 +633,8 @@ export class ChromaSync {
               summaryIds.add(meta.sqlite_id);
             } else if (meta.doc_type === 'user_prompt') {
               promptIds.add(meta.sqlite_id);
+            } else if (meta.doc_type === 'assistant_response') {
+              responseIds.add(meta.sqlite_id);
             }
           }
         }
@@ -590,10 +656,11 @@ export class ChromaSync {
       project: this.project,
       observations: observationIds.size,
       summaries: summaryIds.size,
-      prompts: promptIds.size
+      prompts: promptIds.size,
+      responses: responseIds.size
     });
 
-    return { observations: observationIds, summaries: summaryIds, prompts: promptIds };
+    return { observations: observationIds, summaries: summaryIds, prompts: promptIds, responses: responseIds };
   }
 
   /**
@@ -743,17 +810,65 @@ export class ChromaSync {
         });
       }
 
+      // Build exclusion list for assistant responses
+      const existingResponseIds = Array.from(existing.responses);
+      const responseExclusionClause = existingResponseIds.length > 0
+        ? `AND ar.id NOT IN (${existingResponseIds.join(',')})`
+        : '';
+
+      // Get only assistant responses missing from Chroma
+      const responses = db.db.prepare(`
+        SELECT
+          ar.*,
+          s.project,
+          s.sdk_session_id
+        FROM assistant_responses ar
+        JOIN sdk_sessions s ON ar.claude_session_id = s.claude_session_id
+        WHERE s.project = ? ${responseExclusionClause}
+        ORDER BY ar.id ASC
+      `).all(this.project) as StoredAssistantResponse[];
+
+      const totalResponseCount = db.db.prepare(`
+        SELECT COUNT(*) as count
+        FROM assistant_responses ar
+        JOIN sdk_sessions s ON ar.claude_session_id = s.claude_session_id
+        WHERE s.project = ?
+      `).get(this.project) as { count: number };
+
+      logger.info('CHROMA_SYNC', 'Backfilling assistant responses', {
+        project: this.project,
+        missing: responses.length,
+        existing: existing.responses.size,
+        total: totalResponseCount.count
+      });
+
+      // Format all response documents
+      const responseDocs: ChromaDocument[] = responses.map(r => this.formatAssistantResponseDoc(r));
+
+      // Sync in batches
+      for (let i = 0; i < responseDocs.length; i += this.BATCH_SIZE) {
+        const batch = responseDocs.slice(i, i + this.BATCH_SIZE);
+        await this.addDocuments(batch);
+
+        logger.info('CHROMA_SYNC', 'Backfill progress', {
+          project: this.project,
+          progress: `${Math.min(i + this.BATCH_SIZE, responseDocs.length)}/${responseDocs.length}`
+        });
+      }
+
       logger.info('CHROMA_SYNC', 'Smart backfill complete', {
         project: this.project,
         synced: {
           observationDocs: allDocs.length,
           summaryDocs: summaryDocs.length,
-          promptDocs: promptDocs.length
+          promptDocs: promptDocs.length,
+          responseDocs: responseDocs.length
         },
         skipped: {
           observations: existing.observations.size,
           summaries: existing.summaries.size,
-          prompts: existing.prompts.size
+          prompts: existing.prompts.size,
+          responses: existing.responses.size
         }
       });
 
@@ -820,7 +935,8 @@ export class ChromaSync {
       // - prompt_{id} (user prompts)
       const obsMatch = docId.match(/obs_(\d+)_/);
       const summaryMatch = docId.match(/summary_(\d+)_/);
-      const promptMatch = docId.match(/prompt_(\d+)/);
+      const promptMatch = docId.match(/^prompt_(\d+)$/);
+      const responseMatch = docId.match(/^response_(\d+)$/);
 
       let sqliteId: number | null = null;
       if (obsMatch) {
@@ -829,6 +945,8 @@ export class ChromaSync {
         sqliteId = parseInt(summaryMatch[1], 10);
       } else if (promptMatch) {
         sqliteId = parseInt(promptMatch[1], 10);
+      } else if (responseMatch) {
+        sqliteId = parseInt(responseMatch[1], 10);
       }
 
       if (sqliteId !== null && !ids.includes(sqliteId)) {
