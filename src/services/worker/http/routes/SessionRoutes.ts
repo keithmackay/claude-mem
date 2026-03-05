@@ -522,6 +522,28 @@ export class SessionRoutes extends BaseRouteHandler {
     const id = store.saveAssistantResponse(claudeSessionId, Number(promptNumber), responseText);
 
     logger.info('SESSION', 'Assistant response logged', { claudeSessionId, promptNumber, id });
+
+    // Sync to Chroma (fire-and-forget, same pattern as syncUserPrompt)
+    const session = store.findActiveSDKSession(claudeSessionId);
+    if (session && session.sdk_session_id) {
+      const chromaStart = Date.now();
+      this.dbManager.getChromaSync().syncAssistantResponse(
+        id,
+        session.sdk_session_id,
+        session.project,
+        responseText,
+        Number(promptNumber),
+        Math.floor(Date.now() / 1000)
+      ).then(() => {
+        logger.debug('CHROMA', 'Assistant response synced', {
+          responseId: id,
+          duration: `${Date.now() - chromaStart}ms`
+        });
+      }).catch((err: Error) => {
+        logger.error('CHROMA', 'Failed to sync assistant_response', { responseId: id }, err);
+      });
+    }
+
     res.json({ id, skipped: false });
   });
 }

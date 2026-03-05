@@ -1390,6 +1390,32 @@ export class SessionStore {
    * Get user prompts by IDs (for hybrid Chroma search)
    * Returns prompts in specified temporal order
    */
+  getAssistantResponsesByIds(
+    ids: number[],
+    options: { orderBy?: 'date_desc' | 'date_asc'; limit?: number } = {}
+  ): any[] {
+    if (ids.length === 0) return [];
+
+    const { orderBy = 'date_desc', limit } = options;
+    const orderClause = orderBy === 'date_asc' ? 'ASC' : 'DESC';
+    const limitClause = limit ? `LIMIT ${limit}` : '';
+    const placeholders = ids.map(() => '?').join(',');
+
+    const stmt = this.db.prepare(`
+      SELECT
+        ar.*,
+        s.project,
+        s.sdk_session_id
+      FROM assistant_responses ar
+      JOIN sdk_sessions s ON ar.claude_session_id = s.claude_session_id
+      WHERE ar.id IN (${placeholders})
+      ORDER BY ar.created_at_epoch ${orderClause}
+      ${limitClause}
+    `);
+
+    return stmt.all(...ids) as any[];
+  }
+
   getUserPromptsByIds(
     ids: number[],
     options: { orderBy?: 'date_desc' | 'date_asc'; limit?: number } = {}

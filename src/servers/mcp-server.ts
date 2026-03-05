@@ -35,6 +35,7 @@ const TOOL_ENDPOINT_MAP: Record<string, string> = {
   'search_observations': '/api/search/observations',
   'search_sessions': '/api/search/sessions',
   'search_user_prompts': '/api/search/prompts',
+  'search_assistant_responses': '/api/search/responses',
   'find_by_concept': '/api/search/by-concept',
   'find_by_file': '/api/search/by-file',
   'find_by_type': '/api/search/by-type',
@@ -244,6 +245,21 @@ const tools = [
     }),
     handler: async (args: any) => {
       const endpoint = TOOL_ENDPOINT_MAP['search_user_prompts'];
+      return await callWorkerAPI(endpoint, args);
+    }
+  },
+  {
+    name: 'search_assistant_responses',
+    description: 'Search assistant responses using vector semantic search. Searches what Claude answered, not what was asked.',
+    inputSchema: z.object({
+      query: z.string().describe('Semantic search query'),
+      format: z.enum(['index', 'full']).default('index').describe('Output format: "index" for snippets (default), "full" for complete responses'),
+      project: z.string().optional().describe('Filter by project name'),
+      limit: z.number().min(1).max(100).default(20).describe('Maximum number of results'),
+      orderBy: z.enum(['date_desc', 'date_asc']).default('date_desc').describe('Sort order')
+    }),
+    handler: async (args: any) => {
+      const endpoint = TOOL_ENDPOINT_MAP['search_assistant_responses'];
       return await callWorkerAPI(endpoint, args);
     }
   },

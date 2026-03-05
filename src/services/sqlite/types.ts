@@ -283,3 +283,20 @@ export interface UserPromptSearchResult extends UserPromptRow {
   rank?: number; // FTS5 relevance score (lower is better)
   score?: number; // Normalized score (higher is better, 0-1)
 }
+
+export interface AssistantResponseRow {
+  id: number;
+  claude_session_id: string;
+  prompt_number: number;
+  response_text: string;
+  message_uuid: string | null;
+  created_at: string;
+  created_at_epoch: number;
+  sdk_session_id: string;
+  project: string;
+}
+
+export interface AssistantResponseSearchResult extends AssistantResponseRow {
+  rank?: number;
+  score?: number;
+}

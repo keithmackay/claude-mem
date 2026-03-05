@@ -1103,6 +1103,78 @@ export class SearchManager {
   }
 
   /**
+   * Tool handler: search_assistant_responses
+   */
+  async searchAssistantResponses(args: any): Promise<any> {
+    try {
+      const normalized = this.normalizeParams(args);
+      const { query, format = 'index', ...options } = normalized;
+      let results: any[] = [];
+
+      if (this.chromaSync) {
+        try {
+          happy_path_error__with_fallback('[mcp-server] Using hybrid semantic search for assistant responses');
+
+          const chromaResults = await this.queryChroma(query, 100, { doc_type: 'assistant_response' });
+          happy_path_error__with_fallback(`[mcp-server] Chroma returned ${chromaResults.ids.length} semantic matches`);
+
+          if (chromaResults.ids.length > 0) {
+            const ninetyDaysAgo = Date.now() - (90 * 24 * 60 * 60 * 1000);
+            const recentIds = chromaResults.ids.filter((_id, idx) => {
+              const meta = chromaResults.metadatas[idx];
+              return meta && meta.created_at_epoch > ninetyDaysAgo;
+            });
+
+            happy_path_error__with_fallback(`[mcp-server] ${recentIds.length} results within 90-day window`);
+
+            if (recentIds.length > 0) {
+              const limit = options.limit || 20;
+              results = this.sessionStore.getAssistantResponsesByIds(recentIds, { orderBy: 'date_desc', limit });
+              happy_path_error__with_fallback(`[mcp-server] Hydrated ${results.length} assistant responses from SQLite`);
+            }
+          }
+        } catch (chromaError: any) {
+          happy_path_error__with_fallback('[mcp-server] Chroma query failed - no results (FTS5 fallback removed):', chromaError.message);
+        }
+      }
+
+      if (results.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: query ? `No assistant responses found matching "${query}"` : 'No assistant responses found'
+          }]
+        };
+      }
+
+      const header = `Found ${results.length} assistant response(s) matching "${query}":\n\n`;
+      const formattedResults = results.map((r: any, i: number) => {
+        const date = r.created_at ? new Date(r.created_at).toLocaleDateString() : 'unknown date';
+        const snippet = r.response_text.length > 300
+          ? r.response_text.substring(0, 300) + '...'
+          : r.response_text;
+        return `**${i + 1}.** [${date}] (prompt #${r.prompt_number}, project: ${r.project})\n${snippet}`;
+      });
+      const combinedText = header + formattedResults.join('\n\n');
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: combinedText
+        }]
+      };
+    } catch (error: any) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Search failed: ${error.message}`
+        }],
+        isError: true
+      };
+    }
+  }
+
+  /**
    * Tool handler: find_by_concept
    */
   async findByConcept(args: any): Promise<any> {

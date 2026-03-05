@@ -28,6 +28,7 @@ export class SearchRoutes extends BaseRouteHandler {
     app.get('/api/search/observations', this.handleSearchObservations.bind(this));
     app.get('/api/search/sessions', this.handleSearchSessions.bind(this));
     app.get('/api/search/prompts', this.handleSearchPrompts.bind(this));
+    app.get('/api/search/responses', this.handleSearchResponses.bind(this));
     app.get('/api/search/by-concept', this.handleSearchByConcept.bind(this));
     app.get('/api/search/by-file', this.handleSearchByFile.bind(this));
     app.get('/api/search/by-type', this.handleSearchByType.bind(this));
@@ -112,6 +113,15 @@ export class SearchRoutes extends BaseRouteHandler {
    */
   private handleSearchPrompts = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const result = await this.searchManager.searchUserPrompts(req.query);
+    res.json(result);
+  });
+
+  /**
+   * Search assistant responses
+   * GET /api/search/responses?query=...&format=index&limit=20
+   */
+  private handleSearchResponses = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const result = await this.searchManager.searchAssistantResponses(req.query);
     res.json(result);
   });
 
