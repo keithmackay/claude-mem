@@ -37,6 +37,7 @@ import os
 import sqlite3
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -62,6 +63,7 @@ MAX_RETRIES      = int(os.environ.get("MAX_RETRIES",     "5"))
 DRY_RUN         = os.environ.get("DRY_RUN", "0") == "1"
 SKIP_RESPONSES  = os.environ.get("SKIP_RESPONSES", "0") == "1"
 SKIP_EMBEDDINGS = os.environ.get("SKIP_EMBEDDINGS", "0") == "1"
+STATUS_FILE     = Path(os.environ.get("STATUS_FILE", str(HOME / "Projects" / "nanobot" / "scripts" / "status.md")))
 
 # Map project name → Claude Code project directory name
 PROJECT_DIR_MAP: dict[str, str] = {
@@ -113,6 +115,35 @@ class AdaptiveBatcher:
 
 
 # ---------------------------------------------------------------------------
+# Status writer
+# ---------------------------------------------------------------------------
+
+class StatusWriter:
+    """
+    Writes progress to a status file after each successful batch.
+
+    First 5 batches: writes every batch.
+    After that: writes every 10 batches.
+    """
+
+    def __init__(self, path: Path = STATUS_FILE) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._batch_count = 0
+        self._write_every = 1
+
+    def record(self, completed: int, total: int, label: str, project: str) -> None:
+        self._batch_count += 1
+        if self._batch_count == 5:
+            self._write_every = 10
+        if self._batch_count % self._write_every == 0:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"{ts} — {completed}/{total} {label} ({project})\n"
+            with open(self.path, "a") as f:
+                f.write(line)
+
+
+# ---------------------------------------------------------------------------
 # Ollama helpers
 # ---------------------------------------------------------------------------
 
@@ -147,6 +178,8 @@ def embed_and_add(
     t0: float,
     total_added_ref: list[int],
     label: str,
+    project: str = "",
+    status: StatusWriter | None = None,
 ) -> int:
     """
     Embed `texts` and add to Chroma `col`, using adaptive batching.
@@ -180,6 +213,8 @@ def embed_and_add(
                 elapsed = time.monotonic() - t0
                 rate = total_added_ref[0] / elapsed if elapsed > 0 else 0
                 print(f"    {label}: {added}/{total}  (batch={batcher.size}, {rate:.1f} docs/s)    ", end="\r", flush=True)
+                if status:
+                    status.record(added, total, label, project)
                 success = True
                 break
 
@@ -467,6 +502,9 @@ def main() -> None:
     total_added_ref = [0]
     t0 = time.monotonic()
     batcher = AdaptiveBatcher()
+    status = StatusWriter()
+    print(f"Status file: {STATUS_FILE}")
+    print()
 
     for project in projects:
         col_name = f"cm__{project}"
@@ -507,7 +545,7 @@ def main() -> None:
                     "created_at_epoch": r["created_at_epoch"],
                     "prompt_number": r["prompt_number"],
                 } for r in missing]
-                added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "prompts")
+                added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "prompts", project, status)
                 print(f"    prompts: {added} added{'':30}")
 
         # ---- Observations ------------------------------------------------
@@ -543,7 +581,7 @@ def main() -> None:
                         texts.append(fact); ids.append(f"obs_{obs['id']}_fact_{i}"); metas.append({**base, "field_type": "fact", "fact_index": i})
 
                 if texts:
-                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "observations")
+                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "observations", project, status)
                     print(f"    observations: {added} docs added{'':30}")
 
         # ---- Session summaries -------------------------------------------
@@ -576,7 +614,7 @@ def main() -> None:
                             texts.append(val); ids.append(f"summary_{s['id']}_{field}"); metas.append({**base, "field_type": field})
 
                 if texts:
-                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "summaries")
+                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "summaries", project, status)
                     print(f"    summaries: {added} docs added")
 
         # ---- Assistant responses -----------------------------------------
@@ -612,7 +650,7 @@ def main() -> None:
                         "created_at_epoch": r["created_at_epoch"] or 0,
                         "prompt_number": r["prompt_number"] or 0,
                     } for r in missing_resp]
-                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "responses")
+                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "responses", project, status)
                     print(f"    responses: {added} added{'':30}")
 
         print()
