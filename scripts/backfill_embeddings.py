@@ -19,7 +19,12 @@ Options (env vars):
   CLAUDE_MEM_DB       path to SQLite DB (default: ~/.claude-mem/claude-mem.db)
   CLAUDE_PROJECTS_DIR path to Claude Code session files (default: ~/.claude/projects)
   PROJECT             restrict to one project (default: all)
-  BATCH_SIZE          docs per Chroma batch (default: 100)
+  BATCH_SIZE_START    initial docs per embed batch (default: 25)
+  BATCH_SIZE_MIN      minimum batch size under pressure (default: 5)
+  BATCH_SIZE_MAX      maximum batch size when healthy (default: 100)
+  SCALE_UP_AFTER      consecutive successes before increasing batch size (default: 10)
+  EMBED_TIMEOUT       seconds per embed call before retry (default: 60)
+  MAX_RETRIES         embed attempts per batch before abort (default: 5)
   DRY_RUN             set to '1' to print counts without syncing
   SKIP_RESPONSES      set to '1' to skip assistant response backfill
   SKIP_EMBEDDINGS     set to '1' to skip Chroma embedding backfill
@@ -30,7 +35,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -45,55 +49,193 @@ DATA_DIR        = os.environ.get("CHROMA_DATA_DIR",     str(HOME / ".claude-mem"
 DB_PATH         = os.environ.get("CLAUDE_MEM_DB",        str(HOME / ".claude-mem" / "claude-mem.db"))
 PROJECTS_DIR    = os.environ.get("CLAUDE_PROJECTS_DIR",  str(HOME / ".claude" / "projects"))
 OLLAMA_BASE     = os.environ.get("OLLAMA_BASE_URL",      "http://localhost:11434")
-OLLAMA_URL      = OLLAMA_BASE + "/api/embed"   # batch endpoint, supports all models
+OLLAMA_URL      = OLLAMA_BASE + "/api/embed"
+OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
 MODEL           = os.environ.get("OLLAMA_EMBED_MODEL",   "all-minilm")
 FILTER_PROJECT  = os.environ.get("PROJECT", "")
-BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", "100"))
+BATCH_SIZE_START = int(os.environ.get("BATCH_SIZE_START", "25"))
+BATCH_SIZE_MIN   = int(os.environ.get("BATCH_SIZE_MIN",   "5"))
+BATCH_SIZE_MAX   = int(os.environ.get("BATCH_SIZE_MAX",   "100"))
+SCALE_UP_AFTER   = int(os.environ.get("SCALE_UP_AFTER",  "10"))
+EMBED_TIMEOUT    = int(os.environ.get("EMBED_TIMEOUT",   "60"))
+MAX_RETRIES      = int(os.environ.get("MAX_RETRIES",     "5"))
 DRY_RUN         = os.environ.get("DRY_RUN", "0") == "1"
 SKIP_RESPONSES  = os.environ.get("SKIP_RESPONSES", "0") == "1"
 SKIP_EMBEDDINGS = os.environ.get("SKIP_EMBEDDINGS", "0") == "1"
 
 # Map project name → Claude Code project directory name
-# Add entries here if the directory name doesn't match the project name.
 PROJECT_DIR_MAP: dict[str, str] = {
     "openclaw": "-Users-keithmackay1--openclaw-workspace",
     "nanobot":  "-Users-keithmackay1-Projects-nanobot",
 }
 
+MAX_CHARS = 500  # all-minilm 256-token limit; dense text hits it ~600 chars
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Adaptive batch sizer
 # ---------------------------------------------------------------------------
 
-MAX_CHARS = 500  # all-minilm has 256-token limit; dense text (paths) hits it ~600 chars
+class AdaptiveBatcher:
+    """
+    Tracks embed success/failure and adjusts batch size accordingly.
 
-def embed_batch(texts: list[str], timeout: int = 300, retries: int = 3) -> list[list[float]]:
-    """Embed texts via Ollama /api/embed (supports all models, accepts array input)."""
+    On success streaks: scales up toward BATCH_SIZE_MAX for throughput.
+    On timeout/error: scales down toward BATCH_SIZE_MIN for resilience.
+    """
+
+    def __init__(
+        self,
+        start: int = BATCH_SIZE_START,
+        min_size: int = BATCH_SIZE_MIN,
+        max_size: int = BATCH_SIZE_MAX,
+        scale_up_after: int = SCALE_UP_AFTER,
+    ) -> None:
+        self.size = start
+        self.min = min_size
+        self.max = max_size
+        self.scale_up_after = scale_up_after
+        self._streak = 0
+
+    def on_success(self) -> None:
+        self._streak += 1
+        if self._streak >= self.scale_up_after and self.size < self.max:
+            old = self.size
+            self.size = min(self.max, self.size + max(1, self.size // 2))
+            self._streak = 0
+            print(f"\n  [batch] healthy streak → scaling up {old} → {self.size}", flush=True)
+
+    def on_failure(self) -> None:
+        self._streak = 0
+        old = self.size
+        self.size = max(self.min, self.size // 2)
+        if self.size < old:
+            print(f"\n  [batch] failure → scaling down {old} → {self.size}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Ollama helpers
+# ---------------------------------------------------------------------------
+
+def ollama_healthy(timeout: int = 5) -> bool:
+    """Return True if Ollama is reachable and responding."""
+    try:
+        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _embed_raw(texts: list[str]) -> list[list[float]]:
+    """Single embed call with no retry logic."""
     truncated = [t[:MAX_CHARS] for t in texts]
     payload = json.dumps({"model": MODEL, "input": truncated}).encode()
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(
-                OLLAMA_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=EMBED_TIMEOUT) as resp:
+        return json.loads(resp.read())["embeddings"]
+
+
+def embed_and_add(
+    col,
+    texts: list[str],
+    ids: list[str],
+    metas: list[dict],
+    batcher: AdaptiveBatcher,
+    t0: float,
+    total_added_ref: list[int],
+    label: str,
+) -> int:
+    """
+    Embed `texts` and add to Chroma `col`, using adaptive batching.
+
+    Handles timeouts by:
+      1. Checking Ollama health
+      2. Scaling batch size down
+      3. Waiting before retry (longer if Ollama is unhealthy)
+
+    Returns total number of documents added.
+    """
+    added = 0
+    i = 0
+    total = len(texts)
+
+    while i < total:
+        size = batcher.size
+        batch_texts = texts[i : i + size]
+        batch_ids   = ids[i : i + size]
+        batch_metas = metas[i : i + size]
+
+        success = False
+        for attempt in range(MAX_RETRIES):
+            try:
+                embs = _embed_raw(batch_texts)
+                if not DRY_RUN:
+                    col.add(documents=batch_texts, embeddings=embs, ids=batch_ids, metadatas=batch_metas)
+                batcher.on_success()
+                added += len(batch_texts)
+                total_added_ref[0] += len(batch_texts)
+                elapsed = time.monotonic() - t0
+                rate = total_added_ref[0] / elapsed if elapsed > 0 else 0
+                print(f"    {label}: {added}/{total}  (batch={batcher.size}, {rate:.1f} docs/s)    ", end="\r", flush=True)
+                success = True
+                break
+
+            except Exception as e:
+                batcher.on_failure()
+                healthy = ollama_healthy()
+                if not healthy:
+                    wait = 30 * (attempt + 1)
+                    print(
+                        f"\n  [embed] Ollama unreachable on attempt {attempt+1}/{MAX_RETRIES}."
+                        f" Waiting {wait}s before retry...",
+                        flush=True,
+                    )
+                else:
+                    wait = 5 * (attempt + 1)
+                    print(
+                        f"\n  [embed] timeout/error ({type(e).__name__}) on attempt {attempt+1}/{MAX_RETRIES}"
+                        f" with batch={size}. Ollama healthy. Retrying in {wait}s (new batch={batcher.size})...",
+                        flush=True,
+                    )
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(wait)
+                    # Re-slice with new (smaller) batch size for retry
+                    size = batcher.size
+                    batch_texts = texts[i : i + size]
+                    batch_ids   = ids[i : i + size]
+                    batch_metas = metas[i : i + size]
+
+        if not success:
+            raise RuntimeError(
+                f"embed_and_add: failed after {MAX_RETRIES} attempts at position {i}/{total} for {label}"
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read())["embeddings"]
-        except TimeoutError:
-            if attempt < retries - 1:
-                wait = 10 * (attempt + 1)
-                print(f"\n  [embed] timeout, retrying in {wait}s (attempt {attempt+1}/{retries})...", flush=True)
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("embed_batch: unreachable")
+
+        i += len(batch_texts)
+
+    return added
 
 
 def warmup_ollama() -> None:
     """Ensure Ollama has the model loaded before batch processing."""
     print(f"Warming up {MODEL} in Ollama...", flush=True)
-    embed_batch(["warmup"])
-    print("Ollama ready.", flush=True)
+    for attempt in range(5):
+        try:
+            _embed_raw(["warmup"])
+            print(f"Ollama ready. (batch_start={BATCH_SIZE_START}, min={BATCH_SIZE_MIN}, max={BATCH_SIZE_MAX})", flush=True)
+            return
+        except Exception as e:
+            wait = 10 * (attempt + 1)
+            healthy = ollama_healthy()
+            print(
+                f"  [warmup] attempt {attempt+1}/5 failed ({e}). "
+                f"Ollama {'healthy but slow' if healthy else 'UNREACHABLE'}. Waiting {wait}s...",
+                flush=True,
+            )
+            time.sleep(wait)
+    raise RuntimeError("Ollama warmup failed after 5 attempts — is Ollama running?")
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +257,7 @@ def extract_assistant_text(content: object) -> str:
 
 
 def iter_jsonl_responses(jsonl_path: Path) -> Iterator[dict]:
-    """Yield assistant turns from a Claude Code session JSONL file.
-
-    Each yielded dict has: session_id, message_uuid, parent_uuid,
-    timestamp, response_text.
-    """
+    """Yield assistant turns from a Claude Code session JSONL file."""
     with open(jsonl_path, encoding="utf-8", errors="replace") as f:
         prompt_counter = 0
         for line in f:
@@ -143,7 +281,6 @@ def iter_jsonl_responses(jsonl_path: Path) -> Iterator[dict]:
             if not text:
                 continue
 
-            # Skip pure tool-call turns (no real text to index)
             if text.startswith("<tool_call>"):
                 continue
 
@@ -209,13 +346,11 @@ def backfill_assistant_responses(db: sqlite3.Connection, project: str) -> int:
         print(f"  [assistant_responses] Dir not found: {jsonl_dir} — skipping")
         return 0
 
-    # Load known session IDs for this project
     rows = db.execute(
         "SELECT claude_session_id FROM sdk_sessions WHERE project = ?", (project,)
     ).fetchall()
     known_sessions = {r[0] for r in rows}
 
-    # Load already-stored message UUIDs to avoid duplicates
     existing_uuids: set[str] = set()
     rows = db.execute(
         """
@@ -234,7 +369,7 @@ def backfill_assistant_responses(db: sqlite3.Connection, project: str) -> int:
     print(f"  [assistant_responses] scanning {len(jsonl_files)} JSONL files...", flush=True)
 
     for i, path in enumerate(jsonl_files):
-        session_id = path.stem  # filename without .jsonl
+        session_id = path.stem
         if session_id not in known_sessions:
             continue
 
@@ -251,7 +386,7 @@ def backfill_assistant_responses(db: sqlite3.Connection, project: str) -> int:
 
             ts = turn["timestamp"] or ""
             try:
-                from datetime import datetime, timezone
+                from datetime import datetime
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 epoch = int(dt.timestamp())
             except Exception:
@@ -274,11 +409,6 @@ def backfill_assistant_responses(db: sqlite3.Connection, project: str) -> int:
         db.commit()
 
     return inserted
-
-
-def batched(items: list, size: int) -> Iterator[list]:
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
 
 
 def get_existing_ids(col, doc_type: str) -> set[int]:
@@ -315,7 +445,6 @@ def main() -> None:
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
 
-    # Discover projects
     if FILTER_PROJECT:
         projects = [FILTER_PROJECT]
     else:
@@ -325,14 +454,19 @@ def main() -> None:
     print(f"Projects to backfill: {projects}")
     print(f"Embedding model: {MODEL} via {OLLAMA_URL}")
     print(f"ChromaDB path: {DATA_DIR}")
+    print(f"Batch sizing: start={BATCH_SIZE_START}, min={BATCH_SIZE_MIN}, max={BATCH_SIZE_MAX}, scale_up_after={SCALE_UP_AFTER}")
+    print(f"Embed timeout: {EMBED_TIMEOUT}s, max retries: {MAX_RETRIES}")
     if DRY_RUN:
         print("[DRY RUN — no writes]")
     print()
 
     warmup_ollama()
     client = chromadb.PersistentClient(path=DATA_DIR)
-    total_added = 0
+
+    # Shared mutable total (passed by ref as single-element list)
+    total_added_ref = [0]
     t0 = time.monotonic()
+    batcher = AdaptiveBatcher()
 
     for project in projects:
         col_name = f"cm__{project}"
@@ -343,6 +477,8 @@ def main() -> None:
                 col_name,
                 metadata={"embedding_model": MODEL, "embedding_provider": "ollama"},
             )
+        else:
+            col = None
 
         # ---- User prompts ------------------------------------------------
         rows = db.execute("""
@@ -355,31 +491,24 @@ def main() -> None:
         """, (project,)).fetchall()
         print(f"  user_prompts: {len(rows)} total")
 
-        if not DRY_RUN and rows:
+        if rows and not DRY_RUN:
             existing = get_existing_ids(col, "user_prompt")
             missing = [r for r in rows if r["id"] not in existing]
             print(f"  user_prompts: {len(existing)} already indexed, {len(missing)} to add")
 
-            added = 0
-            for batch in batched(missing, BATCH_SIZE):
-                texts  = [r["prompt_text"] for r in batch]
-                ids    = [f"prompt_{r['id']}" for r in batch]
-                metas  = [{
+            if missing:
+                texts = [r["prompt_text"] for r in missing]
+                ids   = [f"prompt_{r['id']}" for r in missing]
+                metas = [{
                     "sqlite_id": r["id"],
                     "doc_type":  "user_prompt",
                     "sdk_session_id": r["sdk_session_id"],
                     "project": project,
                     "created_at_epoch": r["created_at_epoch"],
                     "prompt_number": r["prompt_number"],
-                } for r in batch]
-                embs = embed_batch(texts)
-                col.add(documents=texts, embeddings=embs, ids=ids, metadatas=metas)
-                added += len(batch)
-                total_added += len(batch)
-                elapsed = time.monotonic() - t0
-                rate = total_added / elapsed if elapsed > 0 else 0
-                print(f"    prompts: {added}/{len(missing)}  ({rate:.1f} docs/s)", end="\r")
-            print(f"    prompts: {added} added{'':20}")
+                } for r in missing]
+                added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "prompts")
+                print(f"    prompts: {added} added{'':30}")
 
         # ---- Observations ------------------------------------------------
         rows = db.execute("""
@@ -389,37 +518,33 @@ def main() -> None:
         """, (project,)).fetchall()
         print(f"  observations: {len(rows)} total")
 
-        if not DRY_RUN and rows:
+        if rows and not DRY_RUN:
             existing = get_existing_ids(col, "observation")
             missing = [r for r in rows if r["id"] not in existing]
             print(f"  observations: {len(existing)} already indexed, {len(missing)} to add")
 
-            added = 0
-            for obs in missing:
-                docs, ids, metas = [], [], []
-                base = {
-                    "sqlite_id": obs["id"],
-                    "doc_type": "observation",
-                    "sdk_session_id": obs["sdk_session_id"],
-                    "project": project,
-                    "created_at_epoch": obs["created_at_epoch"],
-                    "type": obs["type"] or "change",
-                    "title": obs["title"] or "",
-                }
-                if obs["narrative"]:
-                    docs.append(obs["narrative"]); ids.append(f"obs_{obs['id']}_narrative"); metas.append({**base, "field_type": "narrative"})
-                if obs["text"]:
-                    docs.append(obs["text"]); ids.append(f"obs_{obs['id']}_text"); metas.append({**base, "field_type": "text"})
-                for i, fact in enumerate(json.loads(obs["facts"] or "[]")):
-                    docs.append(fact); ids.append(f"obs_{obs['id']}_fact_{i}"); metas.append({**base, "field_type": "fact", "fact_index": i})
-                if docs:
-                    embs = embed_batch(docs)
-                    col.add(documents=docs, embeddings=embs, ids=ids, metadatas=metas)
-                added += 1
-                total_added += len(docs)
-                if added % 10 == 0:
-                    print(f"    observations: {added}/{len(missing)}", end="\r")
-            print(f"    observations: {added} added{'':20}")
+            if missing:
+                texts, ids, metas = [], [], []
+                for obs in missing:
+                    base = {
+                        "sqlite_id": obs["id"],
+                        "doc_type": "observation",
+                        "sdk_session_id": obs["sdk_session_id"],
+                        "project": project,
+                        "created_at_epoch": obs["created_at_epoch"],
+                        "type": obs["type"] or "change",
+                        "title": obs["title"] or "",
+                    }
+                    if obs["narrative"]:
+                        texts.append(obs["narrative"]); ids.append(f"obs_{obs['id']}_narrative"); metas.append({**base, "field_type": "narrative"})
+                    if obs["text"]:
+                        texts.append(obs["text"]); ids.append(f"obs_{obs['id']}_text"); metas.append({**base, "field_type": "text"})
+                    for i, fact in enumerate(json.loads(obs["facts"] or "[]")):
+                        texts.append(fact); ids.append(f"obs_{obs['id']}_fact_{i}"); metas.append({**base, "field_type": "fact", "fact_index": i})
+
+                if texts:
+                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "observations")
+                    print(f"    observations: {added} docs added{'':30}")
 
         # ---- Session summaries -------------------------------------------
         rows = db.execute("""
@@ -429,34 +554,32 @@ def main() -> None:
         """, (project,)).fetchall()
         print(f"  summaries: {len(rows)} total")
 
-        if not DRY_RUN and rows:
+        if rows and not DRY_RUN:
             existing = get_existing_ids(col, "session_summary")
             missing = [r for r in rows if r["id"] not in existing]
             print(f"  summaries: {len(existing)} already indexed, {len(missing)} to add")
 
-            added = 0
-            for s in missing:
-                docs, ids, metas = [], [], []
-                base = {
-                    "sqlite_id": s["id"],
-                    "doc_type": "session_summary",
-                    "sdk_session_id": s["sdk_session_id"],
-                    "project": project,
-                    "created_at_epoch": s["created_at_epoch"],
-                    "prompt_number": s["prompt_number"] or 0,
-                }
-                for field in ("request", "investigated", "learned", "completed", "next_steps", "notes"):
-                    val = s[field]
-                    if val:
-                        docs.append(val); ids.append(f"summary_{s['id']}_{field}"); metas.append({**base, "field_type": field})
-                if docs:
-                    embs = embed_batch(docs)
-                    col.add(documents=docs, embeddings=embs, ids=ids, metadatas=metas)
-                added += 1
-                total_added += len(docs)
-            print(f"    summaries: {added} added")
+            if missing:
+                texts, ids, metas = [], [], []
+                for s in missing:
+                    base = {
+                        "sqlite_id": s["id"],
+                        "doc_type": "session_summary",
+                        "sdk_session_id": s["sdk_session_id"],
+                        "project": project,
+                        "created_at_epoch": s["created_at_epoch"],
+                        "prompt_number": s["prompt_number"] or 0,
+                    }
+                    for field in ("request", "investigated", "learned", "completed", "next_steps", "notes"):
+                        val = s[field]
+                        if val:
+                            texts.append(val); ids.append(f"summary_{s['id']}_{field}"); metas.append({**base, "field_type": field})
 
-        # ---- Assistant responses (SQLite verbatim + Chroma embeddings) ---
+                if texts:
+                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "summaries")
+                    print(f"    summaries: {added} docs added")
+
+        # ---- Assistant responses -----------------------------------------
         if not SKIP_RESPONSES:
             n_inserted = backfill_assistant_responses(db, project)
             print(f"  assistant_responses: {n_inserted} new rows inserted")
@@ -478,10 +601,9 @@ def main() -> None:
                 missing_resp = [r for r in resp_rows if r["id"] not in existing]
                 print(f"  assistant_responses: {len(existing)} already indexed, {len(missing_resp)} to add")
 
-                added = 0
-                for batch in batched(missing_resp, BATCH_SIZE):
-                    texts = [r["response_text"] for r in batch]
-                    ids   = [f"response_{r['id']}" for r in batch]
+                if missing_resp:
+                    texts = [r["response_text"] for r in missing_resp]
+                    ids   = [f"response_{r['id']}" for r in missing_resp]
                     metas = [{
                         "sqlite_id": r["id"],
                         "doc_type": "assistant_response",
@@ -489,21 +611,16 @@ def main() -> None:
                         "project": project,
                         "created_at_epoch": r["created_at_epoch"] or 0,
                         "prompt_number": r["prompt_number"] or 0,
-                    } for r in batch]
-                    embs = embed_batch(texts)
-                    col.add(documents=texts, embeddings=embs, ids=ids, metadatas=metas)
-                    added += len(batch)
-                    total_added += len(batch)
-                    elapsed = time.monotonic() - t0
-                    rate = total_added / elapsed if elapsed > 0 else 0
-                    print(f"    responses: {added}/{len(missing_resp)}  ({rate:.1f} docs/s)", end="\r")
-                print(f"    responses: {added} added{'':20}")
+                    } for r in missing_resp]
+                    added = embed_and_add(col, texts, ids, metas, batcher, t0, total_added_ref, "responses")
+                    print(f"    responses: {added} added{'':30}")
 
         print()
 
     elapsed = time.monotonic() - t0
-    rate = total_added / elapsed if elapsed > 0 else 0
-    print(f"Backfill complete: {total_added} documents in {elapsed:.1f}s ({rate:.1f} docs/s)")
+    total = total_added_ref[0]
+    rate = total / elapsed if elapsed > 0 else 0
+    print(f"Backfill complete: {total} documents in {elapsed:.1f}s ({rate:.1f} docs/s)")
     db.close()
 
 
