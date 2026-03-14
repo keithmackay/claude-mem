@@ -37,8 +37,8 @@ from mcp.types import TextContent, Tool
 # ---------------------------------------------------------------------------
 
 DATA_DIR = os.environ.get("CHROMA_DATA_DIR", os.path.expanduser("~/.claude-mem/vector-db"))
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "all-minilm")
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://192.168.1.8:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_EMBED_URL = f"{OLLAMA_BASE}/api/embed"
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ def get_client() -> chromadb.PersistentClient:
 # Ollama embedding helper
 # ---------------------------------------------------------------------------
 
-MAX_CHARS = 500  # all-minilm 256-token limit; dense text hits it ~600 chars
+MAX_CHARS = 2000  # nomic-embed-text supports 8192 tokens; 2000 chars is safe and rich
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """Compute embeddings for a list of texts using Ollama /api/embed."""
