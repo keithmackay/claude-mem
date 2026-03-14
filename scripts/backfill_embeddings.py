@@ -52,7 +52,7 @@ PROJECTS_DIR    = os.environ.get("CLAUDE_PROJECTS_DIR",  str(HOME / ".claude" / 
 OLLAMA_BASE     = os.environ.get("OLLAMA_BASE_URL",      "http://localhost:11434")
 OLLAMA_URL      = OLLAMA_BASE + "/api/embed"
 OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
-MODEL           = os.environ.get("OLLAMA_EMBED_MODEL",   "all-minilm")
+MODEL           = os.environ.get("OLLAMA_EMBED_MODEL",   "nomic-embed-text")
 FILTER_PROJECT  = os.environ.get("PROJECT", "")
 BATCH_SIZE_START = int(os.environ.get("BATCH_SIZE_START", "25"))
 BATCH_SIZE_MIN   = int(os.environ.get("BATCH_SIZE_MIN",   "5"))
@@ -71,7 +71,7 @@ PROJECT_DIR_MAP: dict[str, str] = {
     "nanobot":  "-Users-keithmackay1-Projects-nanobot",
 }
 
-MAX_CHARS = 500  # all-minilm 256-token limit; dense text hits it ~600 chars
+MAX_CHARS = 2000  # nomic-embed-text 8192-token limit; ~500 tokens at typical density
 
 # ---------------------------------------------------------------------------
 # Adaptive batch sizer
